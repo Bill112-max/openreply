@@ -10,6 +10,9 @@ type SyncConfig = {
   keywords: string[];
   privateReply: string;
   publicReply?: string;
+  postId?: string | null;
+  matchAnyPost?: boolean;
+  wholeWordMatch?: boolean;
 };
 
 function envConfig(): SyncConfig | null {
@@ -27,12 +30,6 @@ function envConfig(): SyncConfig | null {
 }
 
 async function configsForEvent(event: WebhookCommentEvent): Promise<SyncConfig[]> {
-  const configured = envConfig();
-  if (configured && (configured.instagramAccountId === "*" || configured.instagramAccountId === event.instagramAccountId)) {
-    console.log("[Webhook Sync] Using environment configuration", { instagramAccountId: event.instagramAccountId, keywordCount: configured.keywords.length, hasPublicReply: Boolean(configured.publicReply) });
-    return [configured];
-  }
-
   const account = await prisma.instagramAccount.findUnique({
     where: { instagramId: event.instagramAccountId },
     select: {
@@ -41,24 +38,38 @@ async function configsForEvent(event: WebhookCommentEvent): Promise<SyncConfig[]
       provider: true,
       automations: {
         where: { isActive: true },
-        select: { keywords: true, matchAnyWord: true, dmMessage: true, publicReplyEnabled: true, publicReplyMessage: true },
+        select: { keywords: true, matchAnyWord: true, wholeWordMatch: true, postId: true, matchAnyPost: true, dmMessage: true, publicReplyEnabled: true, publicReplyMessage: true },
       },
     },
   });
-  if (!account || account.provider !== "META") return [];
+  if (account && account.provider === "META" && account.automations.length > 0) {
+    console.log("[Webhook Sync] Using active database campaigns", { instagramAccountId: event.instagramAccountId, campaignCount: account.automations.length });
+    const accessToken = decryptToken(account.accessToken);
+    return account.automations.map((automation) => ({
+      instagramAccountId: account.instagramId,
+      accessToken,
+      keywords: automation.matchAnyWord ? [] : automation.keywords,
+      privateReply: automation.dmMessage,
+      publicReply: automation.publicReplyEnabled ? automation.publicReplyMessage ?? undefined : undefined,
+      postId: automation.postId,
+      matchAnyPost: automation.matchAnyPost,
+      wholeWordMatch: automation.wholeWordMatch,
+    }));
+  }
 
-  const accessToken = decryptToken(account.accessToken);
-  return account.automations.map((automation) => ({
-    instagramAccountId: account.instagramId,
-    accessToken,
-    keywords: automation.matchAnyWord ? [] : automation.keywords,
-    privateReply: automation.dmMessage,
-    publicReply: automation.publicReplyEnabled ? automation.publicReplyMessage ?? undefined : undefined,
-  }));
+  const configured = envConfig();
+  if (configured && (configured.instagramAccountId === "*" || configured.instagramAccountId === event.instagramAccountId)) {
+    console.log("[Webhook Sync] Using environment fallback configuration", { instagramAccountId: event.instagramAccountId, keywordCount: configured.keywords.length, hasPublicReply: Boolean(configured.publicReply) });
+    return [configured];
+  }
+
+  return [];
 }
 
 function matches(event: WebhookCommentEvent, config: SyncConfig): boolean {
-  return config.keywords.length === 0 || matchKeywords(event.commentText, config.keywords, true).matched;
+  const postMatches = config.matchAnyPost || !config.postId || config.postId === event.mediaId || config.postId === event.originalMediaId;
+  const keywordMatches = config.keywords.length === 0 || matchKeywords(event.commentText, config.keywords, config.wholeWordMatch ?? true).matched;
+  return postMatches && keywordMatches;
 }
 
 /**
